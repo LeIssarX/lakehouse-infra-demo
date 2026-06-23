@@ -1,0 +1,48 @@
+# Databricks Asset Bundle — Slim Orchestrator
+# Variables and pipeline resources are split into separate files (official best-practice pattern).
+# Documentation: https://docs.databricks.com/aws/en/dev-tools/ci-cd/best-practices
+
+bundle:
+  name: example-lakeflow-pipeline
+
+include:
+  - variables.yml
+  - resources/pipelines/customers_pipeline.yml
+  - resources/dashboards/pipeline_health.yml
+
+# ==========================================================
+# Targets
+# ==========================================================
+
+targets:
+  dev:
+    mode: development
+    default: true
+    # No workspace.host — Databricks CLI reads DATABRICKS_HOST from environment variable.
+    # Set locally: export DATABRICKS_HOST="https://adb-XXXXXXXXXX.azuredatabricks.net"
+    # In CI/CD: injected from DATABRICKS_DEV_HOST repo variable (set by tofu-deploy-dev.yml)
+    variables:
+      environment: "dev"
+      # catalog_name inherited from variables.yml default or --var flag from CI/CD
+      # CI/CD passes: --var="catalog_name=${BUNDLE_DEV_CATALOG_NAME}" (from OpenTofu output)
+      # Local dev: Use default from variables.yml or set via --var flag
+    resources:
+      pipelines:
+        customers_pipeline:
+          name: "customers_pipeline"  # mode: development auto-prefixes with [dev <username>]
+
+  prod:
+    mode: production
+    variables:
+      environment: "prod"
+      # catalog_name inherited from variables.yml default or --var flag from CI/CD
+      # CI/CD passes: --var="catalog_name=${BUNDLE_PROD_CATALOG_NAME}" (from OpenTofu output)
+      environment_tag: "prod"
+    # Run as service principal (not user) for automation
+    run_as:
+      service_principal_name: ${var.prod_service_principal}
+    resources:
+      pipelines:
+        customers_pipeline:
+          name: "customers_pipeline_prod"
+          continuous: true  # Bronze/Silver streaming, Gold batch (auto-resolved)

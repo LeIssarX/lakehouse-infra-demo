@@ -1,0 +1,22 @@
+# Pipeline Health Monitor Dashboard
+# ==========================================================
+# Deploys an AI/BI Dashboard to Databricks that visualizes:
+# - Pipeline run history (last 30 runs)
+# - Query performance trends
+# - User activity and access patterns
+# - Data volume processed over time
+#
+# Prerequisites:
+# - UC system tables must be enabled (system.access, system.query)
+# - A SQL warehouse must exist (set warehouse_id variable)
+#
+# Usage:
+#   databricks bundle deploy -t dev --var="warehouse_id=<WAREHOUSE_ID>"
+# ==========================================================
+
+resources:
+  dashboards:
+    pipeline_health:
+      display_name: "[${var.environment}] Pipeline Health Monitor — ${bundle.name}"
+      warehouse_id: ${var.warehouse_id}
+      file_path: pipeline_health.lvdash.json

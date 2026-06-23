@@ -1,0 +1,421 @@
+# ==========================================================
+# Production Environment Variables (EXAMPLE)
+# ==========================================================
+# INSTRUCTIONS (new project):
+# 1. Copy this file to prod.tfvars:
+#    cp infra/envs/prod/prod.tfvars.example infra/envs/prod/prod.tfvars
+# 2. Fill in all FIXME values with production configuration
+# 3. Commit prod.tfvars to Git (tfvars are versioned for team collaboration)
+# Usage: see infra/CLAUDE.md.
+# ==========================================================
+
+# ==========================================================
+# Environment Identification
+# ==========================================================
+
+environment     = "prod"
+subscription_id = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" # FIXME: Your Azure Subscription ID
+
+# Bootstrap mode: set to true only for the very first apply in a greenfield environment.
+# After initial deployment completes, set back to false (or remove the line entirely).
+bootstrap_mode = false
+
+# ==========================================================
+# Resource Naming
+# ==========================================================
+
+resource_group_name       = "rg-lakehouse-prod"
+databricks_workspace_name = "dbw-lakehouse-prod"
+catalog_name              = "lakehouse_prod"
+storage_account_prefix    = "dlhprod" # Random suffix auto-appended
+
+# LOCAL DEV AUTH: Set this to your workspace URL if you need to run tofu locally
+# against prod (rare — prod is normally CI/CD only). Leave null/omit in CI/CD.
+# databricks_workspace_url = "https://adb-XXXXXXXXXXXXXXXX.X.azuredatabricks.net" # FIXME: your prod workspace URL
+
+# ==========================================================
+# Unity Catalog Metastore Configuration
+# ==========================================================
+
+# BEST PRACTICE: Shared regional metastore (one per Azure region)
+# If dev and prod are in the SAME region, use "existing" mode to share dev's metastore.
+# Security isolation is maintained through ISOLATED catalog mode and workspace bindings.
+#
+# Metastore ID is automatically retrieved from dev's remote state — no manual copy/paste.
+# Just fill in the dev_remote_state_* section below.
+#
+unity_catalog_metastore_mode = "existing"
+
+# Alternative: If dev and prod are in DIFFERENT regions, use "create" mode:
+# unity_catalog_metastore_mode = "create"
+# unity_catalog_metastore_name = "lakehouse-metastore-westeurope" # FIXME: your metastore name
+
+# ==========================================================
+# Remote State: Dev (for shared metastore — prod only)
+# ==========================================================
+# These values tell OpenTofu where to find dev's state so it can
+# automatically read the shared regional metastore ID.
+# Required when unity_catalog_metastore_mode = "existing".
+# Do NOT set these in dev.tfvars.
+
+dev_remote_state_resource_group   = "rg-terraform-state-dev" # FIXME: dev state resource group
+dev_remote_state_storage_account  = "sttfstatedev12345678"    # FIXME: dev state storage account
+dev_remote_state_container        = "tfstate"                 # default: tfstate
+dev_remote_state_key              = "dev.terraform.tfstate"   # default: dev.terraform.tfstate
+
+# ==========================================================
+# Observability
+# ==========================================================
+
+log_retention_days = 90 # Prod: 90 days (compliance requirement)
+
+# ==========================================================
+# Network Configuration
+# ==========================================================
+
+# Production should use VNet injection and Private Link
+enable_vnet_injection = true
+enable_public_access  = false # Private access only
+
+# ==========================================================
+# Network & Private Endpoint
+# ==========================================================
+
+# Private endpoint — recommended for prod (requires VNet injection above)
+# Public access is automatically disabled when this is true
+enable_private_endpoint = true
+
+# VNet configuration
+vnet_name          = "vnet-lakehouse-prod"
+vnet_address_space = ["10.200.0.0/16"] # Different from dev to avoid conflicts
+
+# Subnet prefixes
+public_subnet_address_prefixes  = ["10.200.1.0/24"]
+private_subnet_address_prefixes = ["10.200.2.0/24"]
+
+# ==========================================================
+# Storage Accounts (ADLS Gen2)
+# ==========================================================
+# Provisions one Azure Data Lake Storage Gen2 account per entry.
+# Account name: "{storage_account_prefix}{key}{random}" (max 24 chars total).
+#
+# The "lake" key is REQUIRED — it serves as the Unity Catalog Metastore root.
+# All containers in all accounts are automatically registered as Unity Catalog
+# External Locations (key pattern: "{account}-{container}", e.g. "lake-raw").
+#
+# Available fields:
+#   containers               (optional) - List of ADLS containers to create.
+#                                         Default: all 8 standard lakehouse containers.
+#                                         Standard containers: metastore, landing, raw,
+#                                         curated, core, mart, reporting, sharing
+#   account_tier             (optional) - Storage tier. Default: "Standard"
+#                                         Options: Standard | Premium (high IOPS workloads)
+#   replication_type         (optional) - Azure replication strategy. Default: "LRS"
+#                                         Options: LRS  (local, cheapest)
+#                                                  ZRS  (zone-redundant)
+#                                                  GRS  (geo-redundant — recommended for prod)
+#                                                  GZRS (geo + zone-redundant, max resilience)
+#   enable_lifecycle_policy  (optional) - Auto-tier blobs Hot → Cool → Archive. Default: false
+#   lifecycle_containers     (optional) - Which containers to apply lifecycle to. Default: ["raw"]
+#   cool_after_days          (optional) - Move to Cool tier after N days. Default: 30
+#   archive_after_days       (optional) - Move to Archive tier after N days. Default: 90
+#   delete_after_days        (optional) - Delete blobs after N days. Default: 365 (0 = never)
+#   enable_soft_delete       (optional) - Enable blob soft delete (recovery window). Default: true
+#   soft_delete_retention_days (optional) - Soft delete retention in days. Default: 7
+
+storage_accounts = {
+  "lake" = {
+    containers              = ["metastore", "landing", "raw", "curated", "core", "mart", "reporting", "sharing"]
+    replication_type        = "GRS"          # Geo-redundant for disaster recovery
+    enable_lifecycle_policy = true
+    lifecycle_containers    = ["raw", "landing"]
+    cool_after_days         = 30             # Move infrequently accessed data to Cool
+    archive_after_days      = 90             # Archive after 90 days
+    delete_after_days       = 0              # Never auto-delete in prod (safe default)
+  }
+  # Add a second account for sensitive or domain-separated data:
+  # "secure" = {
+  #   containers         = ["pii", "restricted"]
+  #   replication_type   = "GRS"
+  # }
+}
+
+# ==========================================================
+# Security Configuration
+# ==========================================================
+
+# Key Vault name (optional — auto-generated if omitted)
+# Recommended in prod for stable, predictable names in audit logs.
+# key_vault_name = "kv-lakehouse-prod"
+
+# Key Vault firewall (restrict to corporate network)
+# FIXME: Add your corporate IP ranges
+key_vault_allowed_ips = [
+  # "203.0.113.0/24",   # Example: Corporate office
+  # "198.51.100.0/24"   # Example: VPN range
+]
+
+# IP Access Lists (enabled in prod for security)
+enable_ip_access_lists = true
+governance_allowed_ips = [
+  # FIXME: Add your corporate IP ranges
+  # "10.0.0.0/8",       # Example: Corporate network
+  # "172.16.0.0/12"     # Example: VPN range
+]
+
+# ==========================================================
+# Environment-Specific Tags
+# ==========================================================
+
+# These tags are merged with common.tfvars base tags
+tags = {
+  "Environment"    = "prod"
+  "Purpose"        = "Production Workloads"
+  "CriticalSystem" = "true"
+  "BackupPolicy"   = "Daily"
+}
+
+# ==========================================================
+# Compute: Interactive Clusters
+# ==========================================================
+# Provisions one Databricks interactive cluster per entry.
+# Cluster name: "{environment}-{key}" (e.g. "prod-analytics").
+#
+# Prod best practice: keep clusters = {} — production workloads run via
+# Job Clusters managed by Databricks Asset Bundles (DABs), not interactive clusters.
+# Provision interactive clusters only for shared exploration or analytics teams.
+#
+# Available fields:
+#   owner                    (required) - User email set as single-user cluster owner.
+#                                         Must be a workspace member.
+#   node_type                (optional) - Azure VM size. Default: "Standard_DS4_v2"
+#                                         Options: Standard_DS3_v2  (4 vCPU, 14 GB, cost-efficient)
+#                                                  Standard_DS4_v2  (8 vCPU, 28 GB, default)
+#                                                  Standard_E8_v3   (8 vCPU, 64 GB, memory-optimized)
+#                                                  Standard_E16_v3  (16 vCPU, 128 GB, ML workloads)
+#   min_workers              (optional) - Minimum autoscale workers. Default: 1
+#   max_workers              (optional) - Maximum autoscale workers. Default: 4
+#   spark_version            (optional) - Databricks Runtime version. Default: "auto:latest-lts"
+#                                         Options: "auto:latest-lts"  (recommended — always current LTS)
+#                                                  "auto:latest-ml"   (ML runtime with MLflow, sklearn)
+#                                                  "15.4.x-scala2.12" (pin to specific version)
+#   data_security_mode       (optional) - Unity Catalog security mode. Default: "SINGLE_USER"
+#                                         Options: SINGLE_USER   (required for Row-Level Security)
+#                                                  USER_ISOLATION (shared cluster, no RLS)
+#   policy_key               (optional) - Governance policy to attach. Default: "shared_interactive"
+#                                         Options: shared_interactive  (dev exploration, autoscaling)
+#                                                  ml_clusters         (ML runtimes, GPU-ready)
+#                                                  job_clusters        (batch workloads)
+#                                                  lakeflow_pipelines  (streaming, Photon-enabled)
+#   enable_spot              (optional) - Use Azure Spot instances for cost savings. Default: true
+#                                         Recommended: false in prod (higher availability).
+#   auto_termination_minutes (optional) - Auto-stop idle cluster after N minutes. Default: 30
+
+clusters = {} # Prod: use Job Clusters via DABs instead of interactive clusters
+# Uncomment only for shared exploration clusters:
+# clusters = {
+#   "analytics" = {
+#     owner       = "analyst@company.com"  # FIXME
+#     node_type   = "Standard_E8_v3"
+#     enable_spot = false                  # Prod: disable spot for reliability
+#   }
+# }
+
+# Cluster policy limit: prod enforces tighter cluster caps
+interactive_max_clusters_per_user = 2 # Tighter limit for prod cost control
+
+# Enforce per-user isolation via Unity Catalog (recommended in prod)
+enforce_user_isolation = true
+
+# MLflow auto-logging (disabled in prod — enable only if all pipelines use MLflow)
+# enable_ml_autologging = false  # default: false
+
+# ==========================================================
+# Compute: SQL Warehouses
+# ==========================================================
+# Provisions one Databricks SQL Warehouse per entry.
+# Warehouse name: "{environment}-{key}" (e.g. "prod-engineering").
+#
+# Prod recommendation: provision separate warehouses per team or workload type
+# to isolate cost, performance, and access control.
+#
+# Available fields:
+#   size              (optional) - Cluster size controlling query throughput. Default: "Small"
+#                                  Options (DBU/h per cluster):
+#                                    "X-Small" (1),  "Small" (2),   "Medium" (4),
+#                                    "Large" (8),    "X-Large" (16), "2X-Large" (32),
+#                                    "3X-Large" (64), "4X-Large" (128)
+#   type              (optional) - Warehouse type. Default: "PRO"
+#                                  Options: PRO     (AI/BI, Genie, serverless — recommended)
+#                                           CLASSIC (legacy SQL analytics only)
+#   auto_stop_mins    (optional) - Stop idle warehouse after N minutes. Default: 30
+#                                  Set to 0 to disable auto-stop (not recommended).
+#   enable_serverless (optional) - Use serverless compute for instant cold start. Default: true
+
+sql_warehouses = {
+  "engineering" = {
+    size              = "Small"
+    type              = "PRO"
+    enable_serverless = true
+    auto_stop_mins    = 30
+  }
+  # "analytics" = {
+  #   size           = "Medium"
+  #   auto_stop_mins = 15      # BI users need faster cold start
+  # }
+  # "bi" = {
+  #   size = "Large"           # Larger for concurrent BI tool connections
+  # }
+}
+
+# ==========================================================
+# CI/CD Configuration
+# ==========================================================
+
+# GitHub Actions Service Principal for production
+# FIXME: Set to your AZURE_PROD_CLIENT_ID GitHub secret value
+# cicd_sp_application_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# ==========================================================
+# Workload Service Principal (RECOMMENDED)
+# ==========================================================
+
+# Enable automated service principal for workload execution
+# This creates a dedicated SP for jobs/pipelines/workflows
+enable_workload_sp = true
+
+# Workload SP configuration
+workload_sp_name                   = "Lakehouse Pipeline (prod)"
+workload_sp_allow_cluster_create    = false  # Use job clusters (least privilege)
+workload_sp_enable_sql_access       = true   # Enable SQL queries
+workload_sp_workspace_permission    = null   # No workspace permissions (least privilege)
+
+# Unity Catalog grants for workload SP
+# Grant only the minimum permissions needed for your pipelines
+workload_sp_catalog_grants = {
+  "lakehouse_prod" = ["USE CATALOG"]
+}
+
+workload_sp_schema_grants = {
+  "lakehouse_prod.raw"     = ["USE SCHEMA", "SELECT"]
+  "lakehouse_prod.curated" = ["USE SCHEMA", "SELECT", "MODIFY"]
+  "lakehouse_prod.core"    = ["USE SCHEMA", "SELECT", "MODIFY"]
+  "lakehouse_prod.mart"    = ["USE SCHEMA", "SELECT", "MODIFY"]
+}
+
+# Optional: Volume grants if your pipeline uses volumes
+# workload_sp_volume_grants = {
+#   "lakehouse_prod.raw.raw_files" = ["READ VOLUME", "WRITE VOLUME"]
+# }
+
+# Security: Store credentials in Key Vault (recommended)
+store_workload_sp_in_keyvault = true
+
+# Secret expiration (6 months for production, rotate regularly)
+workload_sp_secret_expiration = "4380h"
+
+# ==========================================================
+# Advanced Production Settings
+# ==========================================================
+
+# Cluster limits (higher for production scale)
+# max_workers_limit = 100
+
+# Key Vault protection (compliance)
+enable_purge_protection              = true
+key_vault_soft_delete_retention_days = 90
+
+# ==========================================================
+# Unity Catalog Grants (Benutzergruppen)
+# ==========================================================
+# Grants for Azure AD groups synced via AIM module.
+# Catalog-level ALL_PRIVILEGES for Admins cascades to all schemas automatically.
+# KEY PROD DIFFERENCE: Engineers have no MODIFY/CREATE_TABLE on gold —
+# only the Workload Service Principal writes to gold in production.
+
+catalog_grants = {
+  admins    = { principal = "Databricks-Admins-Prod",    privileges = ["ALL_PRIVILEGES"] }
+  engineers = { principal = "Databricks-Engineers-Prod", privileges = ["USE_CATALOG"] }
+  analysts  = { principal = "Databricks-Analysts-Prod",  privileges = ["USE_CATALOG"] }
+  stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_CATALOG", "APPLY_TAG"] }
+  users     = { principal = "Databricks-Users-Prod",     privileges = ["USE_CATALOG"] }
+}
+
+schema_grants = {
+  landing = {
+    # Engineers own ingestion — full write access to landing zone
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["USE_SCHEMA", "CREATE_TABLE", "CREATE_VOLUME", "SELECT", "MODIFY", "READ_VOLUME", "WRITE_VOLUME"] }
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "SELECT", "APPLY_TAG"] }
+  }
+  raw = {
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["USE_SCHEMA", "CREATE_TABLE", "CREATE_VOLUME", "SELECT", "MODIFY", "READ_VOLUME", "WRITE_VOLUME"] }
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "SELECT", "APPLY_TAG"] }
+  }
+  curated = {
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"] }
+    analysts  = { principal = "Databricks-Analysts-Prod",  privileges = ["USE_SCHEMA", "SELECT"] }
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "SELECT", "APPLY_TAG"] }
+  }
+  core = {
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"] }
+    analysts  = { principal = "Databricks-Analysts-Prod",  privileges = ["USE_SCHEMA", "SELECT"] }
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "SELECT", "APPLY_TAG"] }
+  }
+  mart = {
+    # Prod: Engineers read-only on mart — pipelines (Workload SP) do the writing
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["USE_SCHEMA", "SELECT"] }
+    analysts  = { principal = "Databricks-Analysts-Prod",  privileges = ["USE_SCHEMA", "SELECT"] }
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "SELECT", "APPLY_TAG"] }
+    users     = { principal = "Databricks-Users-Prod",     privileges = ["USE_SCHEMA", "SELECT"] }
+  }
+  reporting = {
+    analysts  = { principal = "Databricks-Analysts-Prod",  privileges = ["USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"] }
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "SELECT", "APPLY_TAG"] }
+    users     = { principal = "Databricks-Users-Prod",     privileges = ["USE_SCHEMA", "SELECT"] }
+  }
+  sharing = {
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY", "APPLY_TAG"] }
+  }
+}
+
+# ==========================================================
+# System Schema Grants (Unity Catalog system tables)
+# ==========================================================
+# Grant SELECT on system schemas to stewards (governance role) and engineers (observability).
+# System schemas are enabled automatically (enable_system_tables = true in main.tf).
+
+system_schema_grants = {
+  access = {
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["SELECT"] }
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["SELECT"] }
+  }
+  billing = {
+    stewards = { principal = "Databricks-Stewards-Prod", privileges = ["SELECT"] }
+  }
+  lineage = {
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["SELECT"] }
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["SELECT"] }
+  }
+  query = {
+    stewards  = { principal = "Databricks-Stewards-Prod",  privileges = ["SELECT"] }
+    engineers = { principal = "Databricks-Engineers-Prod", privileges = ["SELECT"] }
+  }
+}
+
+# ==========================================================
+# NOTES
+# ==========================================================
+#
+# 1. Production configuration prioritizes:
+#    - Security (VNet injection, IP allow-lists)
+#    - Reliability (GRS storage, no spot instances)
+#    - Compliance (purge protection, longer retention)
+#    - Scale (higher cluster limits)
+#
+# 2. Changes to this file affect only PROD environment
+#    Always test in dev first!
+#
+# 3. Deployment requires manual approval in CI/CD
+#    See .github/workflows/tofu-deploy-prod.yml
+#
+# ==========================================================

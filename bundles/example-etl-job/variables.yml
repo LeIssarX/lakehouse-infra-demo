@@ -1,0 +1,73 @@
+# Bundle Variable Declarations
+# ==========================================================
+# Variable Resolution Order (first match wins):
+# 1. CLI flag:    databricks bundle deploy -t dev --var="catalog_name=custom_catalog"
+# 2. Default value: (defined below)
+#
+# CI/CD Workflow:
+# - tofu-deploy-dev.yml extracts OpenTofu outputs (catalog name, tags)
+# - Stores them as GitHub repo variables (BUNDLE_DEV_CATALOG_NAME, etc.)
+# - bundle-deploy.yml passes them as --var flags
+#
+# Local Development:
+# - Uses defaults below
+# - Override via: databricks bundle deploy -t dev --var="catalog_name=your_catalog"
+# ==========================================================
+
+variables:
+  environment:
+    description: "Deployment environment (dev or prod)"
+    default: "dev"
+
+  catalog_name:
+    description: "Unity Catalog name — inherited from OpenTofu output in CI/CD, or use default for local dev"
+    default: "lakehouse_${var.environment}"
+
+  job_name:
+    description: "Display name for the ETL workflow job"
+    default: "orders_etl_${var.environment}"
+
+  source_path:
+    description: "UC Volume path containing raw source files (JSON/CSV)"
+    default: "/Volumes/${var.catalog_name}/raw/raw_files/orders/"
+
+  raw_table:
+    description: "Target raw table (fully qualified: catalog.schema.table)"
+    default: "${var.catalog_name}.raw.orders_raw"
+
+  curated_table:
+    description: "Target curated table (fully qualified: catalog.schema.table)"
+    default: "${var.catalog_name}.curated.orders"
+
+  mart_table:
+    description: "Target mart table (fully qualified: catalog.schema.table)"
+    default: "${var.catalog_name}.mart.orders_by_region"
+
+  # -----------------------------------------------------------
+  # Tag variables — mirror the infra/common.tfvars tags map.
+  # CI/CD injects production values via --var flags derived from
+  # `tofu output -json tags` (see tofu-deploy-dev/prod.yml).
+  # -----------------------------------------------------------
+
+  environment_tag:
+    description: "Mirrors OpenTofu tags.Environment — set per target"
+    default: "dev"
+
+  project_tag:
+    description: "Mirrors OpenTofu tags.Project (from common.tfvars)"
+    default: "Azure Lakehouse Blueprint"
+
+  owner_tag:
+    description: "Mirrors OpenTofu tags.Owner (from common.tfvars)"
+    default: "DataPlatformTeam"
+
+  cost_center_tag:
+    description: "Mirrors OpenTofu tags.CostCenter (from common.tfvars)"
+    default: "Engineering"
+
+  prod_service_principal:
+    description: |
+      Azure AD App ID of the workload service principal used to run production jobs.
+      CI/CD injects via: tofu output -raw workload_sp_application_id
+      Locally: databricks bundle deploy -t prod --var="prod_service_principal=<APP_ID>"
+    default: "REPLACE_WITH_SP_APPLICATION_ID"

@@ -1,0 +1,6 @@
+# Module test artifacts
+.terraform/
+.terraform.lock.hcl
+*.tfplan
+*.tfstate
+*.tfstate.backup

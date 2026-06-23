@@ -1,0 +1,50 @@
+# Customers Pipeline — Raw → Curated → Mart
+# 7-layer architecture with automatic dependency resolution.
+# Databricks analyzes table dependencies and executes raw → curated → mart in order.
+
+resources:
+  pipelines:
+    customers_pipeline:
+      name: "${var.pipeline_name}"
+
+      # Unity Catalog target
+      catalog: "${var.catalog_name}"
+      target: "raw"  # Default target, but functions write to all schemas
+
+      # Serverless compute
+      serverless: true
+      continuous: false
+      photon: true
+      development: true
+
+      # Cost allocation tags — valid DLT API field; bundle schema v0.240.0 reports as warning (harmless)
+      tags:
+        Environment: ${var.environment_tag}
+        Project: ${var.project_tag}
+        Owner: ${var.owner_tag}
+        CostCenter: ${var.cost_center_tag}
+        ManagedBy: "DatabricksBundle"
+
+      # Source notebooks — one per layer (raw → curated → mart)
+      libraries:
+        - notebook:
+            path: ../../src/notebooks/raw/customers_raw.py
+        - notebook:
+            path: ../../src/notebooks/curated/customers_curated.py
+        - notebook:
+            path: ../../src/notebooks/mart/customers_mart.py
+
+      # Runtime configuration
+      configuration:
+        source_path: "${var.source_path}"
+        checkpoint_path: "${var.checkpoint_path_raw}"
+
+      # Failure notifications
+      notifications:
+        - email_recipients:
+            - "data-team@company.com"
+          alerts:
+            - "on-update-failure"
+            - "on-flow-failure"
+
+      channel: "CURRENT"
