@@ -1,0 +1,299 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/envs/prod/**'   # Prod environment config (prod.tfvars, grants, identity, backend.hcl)
+      # infra/modules/**, infra/*.tf, and infra/common.tfvars are intentionally excluded:
+      # those changes are deployed to prod via release or workflow_dispatch after being
+      # validated in dev first. Keeping them here causes prod to trigger on every dev PR.
+  release:
+    types: [published]  # Trigger on GitHub Release (deliberate prod cut)
+  workflow_dispatch:     # Manual trigger
+
+# Use OIDC for authentication
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ARM_USE_OIDC: true
+  ENVIRONMENT: prod
+
+jobs:
+  deploy-prod:
+    name: Deploy to Production Environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Note: GitHub Environment protection removed to avoid forcing customers to use paid plans
+    # Security is enforced via branch protection rules on 'main' branch instead
+    # See: docs/guides/branch-protection-setup.md
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Check prod credentials configured
+        id: check-creds
+        env:
+          AZURE_PROD_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+        run: |
+          if [ -z "$AZURE_PROD_CLIENT_ID" ]; then
+            echo "::warning::AZURE_PROD_CLIENT_ID is not set — prod SP not yet configured. Run scripts/bootstrap-cicd.sh prod to set it up, then re-trigger."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup OpenTofu
+        if: steps.check-creds.outputs.skip != 'true'
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: "1.10.0"
+          tofu_wrapper: false
+
+      # ==========================================================
+      # Azure Authentication (OIDC)
+      # ==========================================================
+
+      - name: Azure Login (OIDC)
+        if: steps.check-creds.outputs.skip != 'true'
+        uses: azure/login@v3
+        with:
+          # Separate production credentials
+          client-id: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+      
+      # ==========================================================
+      # Prepare Variable Files
+      # ==========================================================
+
+      # Config = the committed tfvars (secrets live in Key Vault, never tfvars).
+      - name: Verify committed tfvars
+        if: steps.check-creds.outputs.skip != 'true'
+        working-directory: infra
+        run: |
+          test -f common.tfvars || { echo "::error::infra/common.tfvars missing — commit it (the wizard writes it)."; exit 1; }
+          test -f envs/prod/prod.tfvars || { echo "::error::infra/envs/prod/prod.tfvars missing — commit it."; exit 1; }
+          echo "✅ Using committed tfvars: common.tfvars + $(ls envs/prod/*.tfvars | tr '\n' ' ')"
+
+      # ==========================================================
+      # OpenTofu Execution
+      # ==========================================================
+      
+      - name: OpenTofu Init
+        if: steps.check-creds.outputs.skip != 'true'
+        id: init
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: tofu init -backend-config=envs/prod/backend.hcl -reconfigure
+
+      # Adopt the pre-registered account SP into state BEFORE plan (idempotent).
+      - name: Adopt CI/CD service principal
+        if: steps.check-creds.outputs.skip != 'true'
+        working-directory: ${{ github.workspace }}
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+        run: ./scripts/import-cicd-sp.sh prod
+
+      - name: Detect Bootstrap Mode
+        if: steps.check-creds.outputs.skip != 'true'
+        id: bootstrap
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+        run: |
+          if tofu state list 2>/dev/null | grep -q "module.key_vault.azurerm_key_vault.main"; then
+            echo "✅ Existing deployment detected - bootstrap_mode=false"
+            echo "mode=false" >> $GITHUB_OUTPUT
+          else
+            echo "🆕 Greenfield deployment detected - bootstrap_mode=true"
+            echo "mode=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: OpenTofu Plan
+        if: steps.check-creds.outputs.skip != 'true'
+        id: plan
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          # Auto-discover all prod *.tfvars (core + grants + identity, no compute).
+          VAR_FILES=""
+          for f in envs/prod/*.tfvars; do
+            VAR_FILES="$VAR_FILES -var-file=$f"
+          done
+          tofu plan \
+            -var-file=common.tfvars \
+            $VAR_FILES \
+            -var bootstrap_mode=${{ steps.bootstrap.outputs.mode }} \
+            -out=tfplan \
+            -no-color | tee plan-output.txt
+
+          echo "### 📋 Production Plan" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -50 plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      
+      - name: Upload OpenTofu Plan
+        if: steps.check-creds.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tofu-plan-prod
+          path: |
+            infra/tfplan
+            infra/plan-output.txt
+
+      # Manual approval handled by GitHub Environment protection (Settings > Environments > prod > Required reviewers)
+      # Native GitHub protection is more secure than third-party actions:
+      # - No supply chain risk from external dependencies
+      # - No access to github.TOKEN required
+      # - Better audit trail and compliance reporting
+
+      - name: OpenTofu Apply
+        if: steps.check-creds.outputs.skip != 'true'
+        id: apply
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          echo "🚀 Applying production changes..."
+          tofu apply \
+            -auto-approve \
+            tfplan
+          echo "✅ Production deployment complete"
+      
+      # ==========================================================
+      # Post-Deployment
+      # ==========================================================
+      
+      - name: Extract Outputs & Store Bundle Variables
+        if: steps.check-creds.outputs.skip != 'true'
+        id: outputs
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_PROD_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_PROD_SUBSCRIPTION_ID }}
+          # PAT with variables:write scope — required because GITHUB_TOKEN cannot write repo variables.
+          GH_TOKEN: ${{ secrets.GH_VARIABLE_TOKEN }}
+        run: |
+          WORKSPACE_URL=$(tofu output -raw databricks_workspace_url)
+          WORKSPACE_ID=$(tofu output -raw databricks_workspace_id)
+          STORAGE_ACCOUNT=$(tofu output -json storage_account_names | jq -r '.lake')
+          CATALOG_NAME=$(tofu output -raw unity_catalog_catalog_name)
+          WORKLOAD_SP=$(tofu output -raw workload_sp_application_id 2>/dev/null || echo "")
+
+          echo "workspace_url=$WORKSPACE_URL" >> $GITHUB_OUTPUT
+          echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
+          echo "storage_account=$STORAGE_ACCOUNT" >> $GITHUB_OUTPUT
+
+          # Persist values as repo variables — consumed by bundle-deploy.yml --var flags.
+          # Needs a classic PAT (GH_VARIABLE_TOKEN) with variables:write; GITHUB_TOKEN can't
+          # write repo variables. The wizard's non-interactive bootstrap skips the PAT prompt,
+          # so this is best-effort: a successful apply must not go red over a missing token.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::GH_VARIABLE_TOKEN not set — skipping repo variable updates (DATABRICKS_PROD_HOST, BUNDLE_*). Set a classic PAT with variables:write to enable auto-updates; the infra deploy is unaffected."
+          else
+            gh variable set DATABRICKS_PROD_HOST     --body "$WORKSPACE_URL"
+            gh variable set BUNDLE_PROD_CATALOG_NAME --body "$CATALOG_NAME"
+            if [ -n "$WORKLOAD_SP" ]; then
+              gh variable set BUNDLE_PROD_SP_APP_ID  --body "$WORKLOAD_SP"
+            fi
+          fi
+
+          echo "### 🎉 Production Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** prod" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace URL:** $WORKSPACE_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace ID:** $WORKSPACE_ID" >> $GITHUB_STEP_SUMMARY
+          echo "**Storage Account:** $STORAGE_ACCOUNT" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Create Release Comment
+        if: steps.check-creds.outputs.skip != 'true' && github.event_name == 'release'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const output = `### 🎉 Production Deployment Successful
+            
+            **Release:** ${{ github.event.release.tag_name }}
+            **Environment:** prod
+            **Workspace URL:** ${{ steps.outputs.outputs.workspace_url }}
+            **Workspace ID:** ${{ steps.outputs.outputs.workspace_id }}
+            **Storage Account:** ${{ steps.outputs.outputs.storage_account }}
+            
+            Deployed by: @${{ github.actor }}
+            
+            **Post-Deployment Tasks:**
+            1. ✅ Verify resources in Azure Portal
+            2. 📊 Check monitoring dashboards
+            3. 🔍 Review logs for errors
+            4. 📝 Update runbooks if needed
+            5. 👥 Notify stakeholders
+            `;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: output
+            });
+
+      # ==========================================================
+      # Notifications
+      # ==========================================================
+      
+      # FIXME: Uncomment to enable Slack notifications (set SLACK_WEBHOOK_PROD secret)
+      # - name: Notify Slack (Success)
+      #   if: success()
+      #   uses: slackapi/slack-github-action@v1.25.0
+      #   with:
+      #     webhook-url: ${{ secrets.SLACK_WEBHOOK_PROD }}
+      #     payload: |
+      #       {
+      #         "text": "✅ Production Deployment Successful",
+      #         "blocks": [{"type": "section", "text": {"type": "mrkdwn",
+      #           "text": "🎉 *Production deployment completed*\n*Release:* ${{ github.event.release.tag_name }}\n*Workspace:* ${{ steps.outputs.outputs.workspace_url }}"}}]
+      #       }
+
+      # FIXME: Uncomment to enable Slack failure notifications
+      # - name: Notify Slack (Failure)
+      #   if: failure()
+      #   uses: slackapi/slack-github-action@v1.25.0
+      #   with:
+      #     webhook-url: ${{ secrets.SLACK_WEBHOOK_PROD }}
+      #     payload: |
+      #       {
+      #         "text": "❌ Production Deployment Failed",
+      #         "blocks": [{"type": "section", "text": {"type": "mrkdwn",
+      #           "text": "🚨 *Production deployment failed*\n*Release:* ${{ github.event.release.tag_name }}\n*Action:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"}}]
+      #       }

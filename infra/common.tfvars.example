@@ -1,0 +1,223 @@
+# ==========================================================
+# Common Variables - Single Source of Truth (EXAMPLE)
+# ==========================================================
+# INSTRUCTIONS (new project):
+# 1. Copy this file to common.tfvars:
+#    cp infra/common.tfvars.example infra/common.tfvars
+# 2. Fill in all FIXME values
+# 3. Commit common.tfvars to Git (tfvars are versioned for team collaboration)
+# NOTE: Real secrets (passwords, tokens) belong in Azure Key Vault, not here.
+# ==========================================================
+
+# ==========================================================
+# Azure Regional Configuration
+# ==========================================================
+
+location = "germanywestcentral" # FIXME: Choose your primary Azure region
+
+# ==========================================================
+# Databricks Account Configuration
+# ==========================================================
+
+# Databricks Account ID (required for AIM and account-level features)
+# Find at: https://accounts.azuredatabricks.net/ -> Settings -> Account ID
+databricks_account_id = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" # FIXME: Your account ID
+
+# ==========================================================
+# Unity Catalog Schema Definitions
+# ==========================================================
+
+# 7-layer lakehouse architecture schema structure
+# Applied to all environment catalogs (lakehouse_dev, lakehouse_prod, etc.)
+catalog_schemas = {
+  landing = {
+    comment = "Landing zone for external data"
+    volumes = {
+      incoming = { type = "MANAGED", comment = "Incoming files from external sources" }
+    }
+  }
+  raw = {
+    comment = "Minimally processed raw data"
+    volumes = {
+      raw_files   = { type = "MANAGED", comment = "Raw files and unstructured data" }
+      checkpoints = { type = "MANAGED", comment = "Streaming checkpoints for raw pipelines" }
+    }
+  }
+  curated = {
+    comment = "Cleaned, validated, enriched data"
+    volumes = {
+      checkpoints = { type = "MANAGED", comment = "Streaming checkpoints" }
+    }
+  }
+  core = {
+    comment = "Canonical business entities and master data"
+    volumes = {}
+  }
+  mart = {
+    comment = "Business aggregations and KPIs"
+    volumes = {
+      checkpoints = { type = "MANAGED", comment = "Materialized view refresh checkpoints" }
+      ml_models   = { type = "MANAGED", comment = "ML models and artifacts" }
+    }
+  }
+  reporting = {
+    comment = "Reporting-ready views and dashboard datasets"
+    volumes = {}
+  }
+  sharing = {
+    comment = "External data products (Delta Sharing)"
+    volumes = {}
+  }
+}
+
+# ==========================================================
+# Storage Configuration
+# ==========================================================
+
+# Storage accounts map — key "lake" is required (Unity Catalog Metastore root).
+# Add additional accounts for domain separation or billing isolation.
+storage_accounts = {
+  "lake" = {
+    containers       = ["metastore", "landing", "raw", "curated", "core", "mart", "reporting", "sharing"]
+    account_tier     = "Standard" # Standard or Premium
+    replication_type = "LRS"      # LRS (dev) or GRS (prod recommended)
+  }
+}
+
+# ==========================================================
+# Governance & Security Configuration
+# ==========================================================
+
+# Approved VM SKUs for cluster creation
+allowed_node_types = [
+  "Standard_DS3_v2",
+  "Standard_DS4_v2",
+  "Standard_E8_v3",
+  "Standard_E16_v3"
+]
+
+auto_termination_minutes     = 30   # Auto-terminate idle clusters
+max_cluster_lifetime_minutes = null # null = no limit
+max_workers_limit            = 10   # Per-cluster worker limit
+enable_spot_instances        = true # Cost savings vs availability
+max_token_lifetime_days      = 90   # PAT token max lifetime
+
+# ==========================================================
+# Workspace Configuration
+# ==========================================================
+
+workspace_sku             = "premium" # premium or trial
+enable_unity_catalog      = true
+enable_serverless_compute = true
+catalog_isolation_mode    = "ISOLATED" # ISOLATED or OPEN
+
+# ==========================================================
+# Key Vault Configuration
+# ==========================================================
+
+key_vault_soft_delete_retention_days = 7     # Compliance retention period (7 dev, 90 prod)
+enable_purge_protection              = false # false for dev, true for prod
+key_vault_secret_scope_name          = "kv-backed-scope" # Databricks secret scope name
+key_vault_rbac_propagation_wait      = "180s"            # RBAC propagation wait (increase to "300s" if KV errors occur)
+
+# ==========================================================
+# Project Metadata
+# ==========================================================
+
+project_name     = "LakehouseBlueprint" # FIXME: Your project name (used as resource group tag)
+project_slug     = "lakehouse"          # FIXME: short slug (a-z0-9, <=10) — namespaces state backend / CI-CD SP / AD groups / log analytics so multiple instances coexist in one subscription
+log_analytics_sku = "PerGB2018"         # Log Analytics pricing tier
+
+# ==========================================================
+# Workspace & Governance Feature Flags
+# ==========================================================
+
+enable_enhanced_security         = true # Enhanced Security Monitoring (Premium tier)
+enable_automatic_cluster_updates = true # Automatic cluster security updates
+enable_cluster_policies          = true # Cluster governance policies
+require_unity_catalog            = true # Enforce Unity Catalog in policies
+require_serverless               = true # Prefer serverless in policies
+enable_token_policy              = true # PAT token management policy
+enable_system_tables             = true # Unity Catalog system tables
+enable_predictive_optimization   = true # Automatic Delta table maintenance
+enable_workspace_binding         = true # ISOLATED mode catalog binding
+
+# ==========================================================
+# Compute Settings
+# ==========================================================
+
+enforce_user_isolation = true  # Enforce per-user containers via Unity Catalog
+enable_ml_autologging  = false # Auto-log MLflow experiments workspace-wide
+
+# Interactive clusters — add entries to provision clusters (empty = no clusters created)
+# clusters = {
+#   "engineering" = { owner = "alice@company.com" }
+#   "ml"          = { owner = "bob@company.com", node_type = "Standard_E16_v3", policy_key = "ml_clusters" }
+# }
+clusters = {}
+
+# SQL Warehouses — add entries to provision warehouses (empty = no warehouses created)
+# sql_warehouses = {
+#   "shared"    = {}
+#   "analytics" = { size = "Medium", auto_stop_mins = 15 }
+# }
+sql_warehouses = {}
+
+# ==========================================================
+# Governance Policy Tuning
+# ==========================================================
+
+# interactive_max_clusters_per_user: set per environment in dev.tfvars / prod.tfvars (5 / 2)
+job_max_clusters_per_user   = 10  # Max concurrent job clusters per user
+ml_max_clusters_per_user    = 3   # Max concurrent ML clusters per user
+autotermination_min_floor   = 10  # Global minimum autotermination (minutes)
+job_autotermination_minutes = 15  # Job cluster termination after completion
+ml_autotermination_min      = 30  # ML cluster autotermination lower bound
+ml_autotermination_max      = 180 # ML cluster autotermination upper bound
+ml_autotermination_default  = 60  # ML cluster autotermination default
+ml_spark_version            = "auto:latest-ml"  # ML runtime default
+pipeline_max_workers        = 10  # Lakeflow/DLT max autoscale workers
+
+ml_allowed_node_types = [
+  "Standard_DS4_v2",  # 8 cores, 28 GB RAM - General purpose
+  "Standard_E8_v3",   # 8 cores, 64 GB RAM  - Memory optimized
+  "Standard_E16_v3"   # 16 cores, 128 GB RAM - Memory optimized
+]
+
+# ==========================================================
+# Base Tags
+# ==========================================================
+
+tags = {
+  "Project"    = "Azure Lakehouse Blueprint" # FIXME: Your project name
+  "ManagedBy"  = "OpenTofu"
+  "Owner"      = "DataPlatformTeam" # FIXME: Your team name
+  "CostCenter" = "Engineering"      # FIXME: Your cost center
+}
+
+# ==========================================================
+# Network Configuration Defaults
+# ==========================================================
+
+# Default subnet sizing (overridden per environment if needed)
+public_subnet_address_prefixes  = ["10.0.1.0/24"]
+private_subnet_address_prefixes = ["10.0.2.0/24"]
+
+# ==========================================================
+# NOTES
+# ==========================================================
+#
+# 1. This file contains GLOBAL values used across ALL environments
+#    Environment-specific values go in infra/envs/{env}.tfvars
+#
+# 2. After creating common.tfvars, use it with:
+#    cd infra/envs/dev
+#    tofu plan -var-file=../../common.tfvars -var-file=../dev.tfvars
+#
+# 3. Authentication (set these environment variables):
+#    export ARM_CLIENT_ID="your-sp-client-id"
+#    export ARM_CLIENT_SECRET="your-sp-client-secret"
+#    export ARM_TENANT_ID="your-tenant-id"
+#    export ARM_SUBSCRIPTION_ID="your-subscription-id"
+#
+# ==========================================================

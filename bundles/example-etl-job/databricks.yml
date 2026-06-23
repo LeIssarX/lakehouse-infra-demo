@@ -1,0 +1,43 @@
+# Databricks Asset Bundle — ETL Job Template
+# Demonstrates a classic 3-task sequential workflow:
+#   extract → transform → load
+#
+# Differences from example-lakeflow-pipeline:
+#   - Uses Databricks Jobs (not DLT/Lakeflow pipelines)
+#   - Sequential task execution with explicit dependencies
+#   - Batch-only (no streaming) — suited for scheduled ETL/ELT
+#   - Notebook-based tasks with widget parameter injection
+#
+# Documentation: https://docs.databricks.com/aws/en/dev-tools/ci-cd/best-practices
+
+bundle:
+  name: example-etl-job
+
+include:
+  - variables.yml
+  - resources/jobs/etl_workflow.yml
+
+# ==========================================================
+# Targets
+# ==========================================================
+
+targets:
+  dev:
+    mode: development
+    default: true
+    # No workspace.host — Databricks CLI reads DATABRICKS_HOST from environment variable.
+    # Set locally: export DATABRICKS_HOST="https://adb-XXXXXXXXXX.azuredatabricks.net"
+    variables:
+      environment: "dev"
+
+  prod:
+    mode: production
+    variables:
+      environment: "prod"
+      environment_tag: "prod"
+    run_as:
+      service_principal_name: ${var.prod_service_principal}
+    resources:
+      jobs:
+        etl_workflow:
+          name: "etl_workflow_prod"

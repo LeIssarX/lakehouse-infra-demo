@@ -1,0 +1,374 @@
+name: Deploy Databricks Bundles
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bundles/**'
+      - '.github/workflows/bundle-deploy.yml'
+  pull_request:
+    paths:
+      - 'bundles/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      bundle_path:
+        description: 'Path to bundle (e.g., bundles/example-lakeflow-pipeline)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ==========================================================
+  # Validation (PR only)
+  # ==========================================================
+  
+  validate-bundles:
+    name: Validate Bundles
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    strategy:
+      matrix:
+        bundle:
+          - bundles/example-lakeflow-pipeline
+          - bundles/example-etl-job
+          # - bundles/example-ml-training
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Databricks CLI
+        uses: databricks/setup-cli@v1.4.0
+
+      - name: Validate Bundle
+        working-directory: ${{ matrix.bundle }}
+        env:
+          DATABRICKS_HOST:                ${{ vars.DATABRICKS_DEV_HOST }}
+          DATABRICKS_AZURE_CLIENT_ID:     ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID:     ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          if [ -z "$DATABRICKS_HOST" ]; then
+            echo "::warning::DATABRICKS_DEV_HOST is not set — skipping bundle validation. This is expected on the first greenfield deploy (workspace not yet provisioned). Re-run after infra deploy sets the variable."
+            exit 0
+          fi
+          databricks bundle validate -t dev \
+            --var="catalog_name=${{ vars.BUNDLE_DEV_CATALOG_NAME }}" \
+            --var="project_tag=${{ vars.BUNDLE_TAG_PROJECT }}" \
+            --var="owner_tag=${{ vars.BUNDLE_TAG_OWNER }}" \
+            --var="cost_center_tag=${{ vars.BUNDLE_TAG_COST_CENTER }}" \
+            --var="environment_tag=dev"
+
+          echo "✅ Bundle validation passed: ${{ matrix.bundle }}"
+      
+      - name: Comment PR with Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const jobStatus = '${{ job.status }}';
+            const icon = jobStatus === 'success' ? '✅' : '❌';
+            const output = `### Bundle Validation: ${{ matrix.bundle }}
+
+            **Status:** ${icon} ${jobStatus}
+
+            *Validated against:* \`dev\` environment`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  # ==========================================================
+  # Deploy to Dev (on push to main)
+  # ==========================================================
+  
+  deploy-dev:
+    name: Deploy to Dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        bundle:
+          - bundles/example-lakeflow-pipeline
+          - bundles/example-etl-job
+          # FIXME: Add more bundles
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Databricks CLI
+        uses: databricks/setup-cli@v1.4.0
+
+      - name: Deploy Bundle
+        working-directory: ${{ matrix.bundle }}
+        env:
+          DATABRICKS_HOST:                ${{ vars.DATABRICKS_DEV_HOST }}
+          DATABRICKS_AZURE_CLIENT_ID:     ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID:     ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          if [ -z "$DATABRICKS_HOST" ]; then
+            echo "::warning::DATABRICKS_DEV_HOST is not set — skipping bundle deploy. This is expected on the first greenfield deploy (the Databricks workspace does not exist yet). Re-run this workflow after the infra deploy completes and sets the variable."
+            exit 0
+          fi
+          echo "Deploying bundle: ${{ matrix.bundle }}"
+          databricks bundle deploy -t dev \
+            --var="catalog_name=${{ vars.BUNDLE_DEV_CATALOG_NAME }}" \
+            --var="project_tag=${{ vars.BUNDLE_TAG_PROJECT }}" \
+            --var="owner_tag=${{ vars.BUNDLE_TAG_OWNER }}" \
+            --var="cost_center_tag=${{ vars.BUNDLE_TAG_COST_CENTER }}" \
+            --var="environment_tag=dev"
+
+          echo "✅ Bundle deployed successfully"
+
+      # Optional: Auto-trigger pipeline run
+      - name: Trigger Pipeline Run
+        if: contains(matrix.bundle, 'lakeflow-pipeline')
+        working-directory: ${{ matrix.bundle }}
+        env:
+          DATABRICKS_HOST:                ${{ vars.DATABRICKS_DEV_HOST }}
+          DATABRICKS_AZURE_CLIENT_ID:     ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID:     ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          if [ -z "$DATABRICKS_HOST" ]; then
+            exit 0
+          fi
+          # FIXME: Uncomment to auto-run pipelines after deployment
+          # databricks bundle run -t dev customers_pipeline
+
+          echo "ℹ️ Skipping auto-run (disabled by default)"
+
+  # ==========================================================
+  # Deploy to Prod (manual or release)
+  # ==========================================================
+  
+  deploy-prod:
+    name: Deploy to Production
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'prod') ||
+      github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: prod  # Requires approval
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Databricks CLI
+        uses: databricks/setup-cli@v1.4.0
+
+      - name: Determine Bundle Path
+        id: bundle
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            BUNDLE_PATH="${{ inputs.bundle_path }}"
+          else
+            # For releases, deploy all bundles
+            BUNDLE_PATH="bundles/example-lakeflow-pipeline"
+          fi
+          
+          echo "path=$BUNDLE_PATH" >> $GITHUB_OUTPUT
+      
+      - name: Validate Production Configuration
+        working-directory: ${{ steps.bundle.outputs.path }}
+        env:
+          DATABRICKS_HOST:                ${{ vars.DATABRICKS_PROD_HOST }}
+          DATABRICKS_AZURE_CLIENT_ID:     ${{ vars.AZURE_PROD_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID:     ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          databricks bundle validate -t prod \
+            --var="catalog_name=${{ vars.BUNDLE_PROD_CATALOG_NAME }}" \
+            --var="project_tag=${{ vars.BUNDLE_TAG_PROJECT }}" \
+            --var="owner_tag=${{ vars.BUNDLE_TAG_OWNER }}" \
+            --var="cost_center_tag=${{ vars.BUNDLE_TAG_COST_CENTER }}" \
+            --var="environment_tag=prod" \
+            --var="prod_service_principal=${{ vars.BUNDLE_PROD_SP_APP_ID }}"
+
+          echo "✅ Production configuration validated"
+
+      - name: Deploy Bundle to Production
+        working-directory: ${{ steps.bundle.outputs.path }}
+        env:
+          DATABRICKS_HOST:                ${{ vars.DATABRICKS_PROD_HOST }}
+          DATABRICKS_AZURE_CLIENT_ID:     ${{ vars.AZURE_PROD_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_PROD_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID:     ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          echo "🚀 Deploying to production: ${{ steps.bundle.outputs.path }}"
+          databricks bundle deploy -t prod \
+            --var="catalog_name=${{ vars.BUNDLE_PROD_CATALOG_NAME }}" \
+            --var="project_tag=${{ vars.BUNDLE_TAG_PROJECT }}" \
+            --var="owner_tag=${{ vars.BUNDLE_TAG_OWNER }}" \
+            --var="cost_center_tag=${{ vars.BUNDLE_TAG_COST_CENTER }}" \
+            --var="environment_tag=prod" \
+            --var="prod_service_principal=${{ vars.BUNDLE_PROD_SP_APP_ID }}"
+
+          echo "✅ Production deployment complete"
+      
+      - name: Create Deployment Summary
+        run: |
+          echo "### 🚀 Production Bundle Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Bundle:** ${{ steps.bundle.outputs.path }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** prod" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Release:** ${{ github.event_name == 'release' && github.ref_name || 'Manual' }}" >> $GITHUB_STEP_SUMMARY
+      
+      # FIXME: Uncomment for Slack notifications
+      # - name: Notify Slack
+      #   if: always()
+      #   uses: slackapi/slack-github-action@v1.25.0
+      #   with:
+      #     webhook-url: ${{ secrets.SLACK_WEBHOOK_PROD }}
+      #     payload: |
+      #       {
+      #         "text": "${{ job.status == 'success' ? '✅' : '❌' }} Production Bundle Deployment: ${{ job.status }}",
+      #         "blocks": [
+      #           {
+      #             "type": "section",
+      #             "text": {
+      #               "type": "mrkdwn",
+      #               "text": "Bundle deployment to production *${{ job.status }}*\n*Bundle:* ${{ steps.bundle.outputs.path }}"
+      #             }
+      #           }
+      #         ]
+      #       }
+
+  # ==========================================================
+  # Run Tests (Optional)
+  # ==========================================================
+  
+  test-bundle:
+    name: Test Bundle
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    strategy:
+      matrix:
+        bundle:
+          - bundles/example-lakeflow-pipeline
+          - bundles/example-etl-job
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      
+      - name: Install Test Dependencies
+        working-directory: ${{ matrix.bundle }}
+        run: |
+          if [ -f requirements-test.txt ]; then
+            pip install -r requirements-test.txt
+          fi
+      
+      - name: Run Unit Tests
+        id: tests
+        working-directory: ${{ matrix.bundle }}
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -v --cov=src --cov-report=xml
+            echo "✅ Unit tests passed"
+          else
+            echo "ℹ️ No tests found"
+          fi
+
+      - name: Upload Coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ github.run_id }}-${{ strategy.job-index }}
+          path: ${{ matrix.bundle }}/coverage.xml
+          if-no-files-found: ignore
+
+# ==========================================================
+# Notes
+# ==========================================================
+
+# TODO Items (marked with FIXME above):
+# 1. Set repository variables:
+#    - DATABRICKS_DEV_HOST  (dev workspace URL, from OpenTofu output)
+#    - DATABRICKS_PROD_HOST (prod workspace URL, from OpenTofu output)
+# 2. Set repository secrets (see docs/guides/cicd-setup.md):
+#    - AZURE_PROD_CLIENT_SECRET (client secret for prod SP: AZURE_PROD_CLIENT_ID)
+# 3. Configure prod environment with required approvers
+# 4. Add more bundles to the matrix as you create them
+# 5. Enable Slack notifications (optional)
+# 6. Configure auto-run behavior for pipelines
+
+# Databricks Authentication:
+# Dev:  Client credentials via DATABRICKS_AZURE_* env vars — same SP as OpenTofu (AZURE_CLIENT_ID/AZURE_CLIENT_SECRET).
+#       No azure/login step needed: the Databricks CLI authenticates directly with client_id + client_secret.
+#       IMPORTANT: azure/login@v3 is intentionally absent from dev jobs. When ARM_USE_OIDC is not set
+#       in the env, azure/login calls `az login` which fails with "No subscriptions found" for OIDC
+#       tokens in certain runner/tenant configurations.
+# Prod: Service Principal client secret — set AZURE_PROD_CLIENT_SECRET in repository secrets.
+#       Required one-time setup: add prod SP to Databricks workspace as admin.
+# See full setup guide: docs/guides/cicd-setup.md
+
+# Bundle Structure:
+# Each bundle should have:
+# - databricks.yml (bundle configuration)
+# - src/ (source code)
+# - resources/ (pipeline/job definitions)
+# - tests/ (unit tests)
+# - README.md (documentation)
+
+# Manual Deployment:
+# To deploy manually via workflow_dispatch:
+# 1. Go to Actions tab
+# 2. Select "Deploy Databricks Bundles"
+# 3. Click "Run workflow"
+# 4. Select environment and bundle path
+# 5. Approve if deploying to prod
+
+# Automatic Deployments:
+# - Dev: Automatically on push to dev (bundles/**)
+# - Prod: On release creation (requires approval)
+
+# Testing Strategy:
+# 1. Unit tests run on PR
+# 2. Bundle validation on PR
+# 3. Deploy to dev on merge
+# 4. Manual approval for prod
+# 5. Deploy to prod on release
+
+# For more information:
+# - Databricks Bundles: https://docs.databricks.com/dev-tools/bundles/
+# - Databricks CLI: https://docs.databricks.com/dev-tools/cli/
+# - GitHub Actions: https://docs.github.com/actions

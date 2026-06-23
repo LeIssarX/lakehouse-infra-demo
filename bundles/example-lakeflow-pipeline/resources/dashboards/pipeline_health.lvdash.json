@@ -1,0 +1,166 @@
+{
+  "datasets": [
+    {
+      "name": "pipeline_runs_30d",
+      "displayName": "Pipeline Runs — Last 30 Days",
+      "query": "SELECT\n  DATE(end_time) AS run_date,\n  COUNT(*) AS total_runs,\n  SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_runs,\n  SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS successful_runs,\n  ROUND(100.0 * SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_rate_pct\nFROM system.lakeflow.pipeline_run_timeline\nWHERE end_time >= CURRENT_TIMESTAMP - INTERVAL 30 DAYS\nGROUP BY DATE(end_time)\nORDER BY run_date DESC"
+    },
+    {
+      "name": "slow_queries",
+      "displayName": "Slow Queries — Last 24h",
+      "query": "SELECT\n  user_name,\n  ROUND(duration / 1000.0, 1) AS duration_sec,\n  rows_produced,\n  end_time,\n  SUBSTR(query_text, 1, 120) AS query_preview\nFROM system.query.history\nWHERE end_time >= CURRENT_TIMESTAMP - INTERVAL 24 HOURS\n  AND duration > 30000\n  AND statement_type IN ('SELECT', 'INSERT', 'MERGE')\nORDER BY duration DESC\nLIMIT 25"
+    },
+    {
+      "name": "user_activity",
+      "displayName": "User Activity — Last 7 Days",
+      "query": "SELECT\n  user_name,\n  COUNT(*) AS query_count,\n  ROUND(AVG(duration) / 1000.0, 1) AS avg_duration_sec,\n  MAX(end_time) AS last_active\nFROM system.query.history\nWHERE end_time >= CURRENT_TIMESTAMP - INTERVAL 7 DAYS\nGROUP BY user_name\nORDER BY query_count DESC\nLIMIT 20"
+    },
+    {
+      "name": "audit_access",
+      "displayName": "Table Access — Last 7 Days",
+      "query": "SELECT\n  user_identity.email AS user_email,\n  request_params.full_name_arg AS table_name,\n  action_name,\n  COUNT(*) AS access_count,\n  MAX(event_time) AS last_accessed\nFROM system.access.audit\nWHERE service_name = 'unityCatalog'\n  AND action_name IN ('getTable', 'selectFromTable', 'modifyTable')\n  AND event_time >= CURRENT_TIMESTAMP - INTERVAL 7 DAYS\nGROUP BY user_identity.email, request_params.full_name_arg, action_name\nORDER BY access_count DESC\nLIMIT 30"
+    },
+    {
+      "name": "query_volume_trend",
+      "displayName": "Query Volume Trend",
+      "query": "SELECT\n  DATE(end_time) AS query_date,\n  COUNT(*) AS total_queries,\n  COUNT(DISTINCT user_name) AS distinct_users,\n  ROUND(AVG(duration) / 1000.0, 1) AS avg_duration_sec\nFROM system.query.history\nWHERE end_time >= CURRENT_TIMESTAMP - INTERVAL 14 DAYS\nGROUP BY DATE(end_time)\nORDER BY query_date"
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "layout": [
+        {
+          "widget": {
+            "name": "header",
+            "textbox_spec": "# Pipeline Health Monitor\n\nMonitoring dashboard for the **example-lakeflow-pipeline** using Unity Catalog system tables.\nData source: `system.query.history`, `system.access.audit`, `system.lakeflow.pipeline_run_timeline`"
+          },
+          "position": {"x": 0, "y": 0, "width": 6, "height": 2}
+        },
+        {
+          "widget": {
+            "name": "pipeline_runs_chart",
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {"fieldName": "run_date", "scale": {"type": "temporal"}, "displayName": "Date"},
+                "y": {"fieldName": "total_runs", "scale": {"type": "quantitative"}, "displayName": "Total Runs"},
+                "color": {"fieldName": "success_rate_pct", "scale": {"type": "quantitative"}, "displayName": "Success Rate %"}
+              },
+              "frame": {"showTitle": true, "title": "Pipeline Runs — Last 30 Days"},
+              "query": {"datasetName": "pipeline_runs_30d", "fields": ["run_date", "total_runs", "failed_runs", "successful_runs", "success_rate_pct"]}
+            }
+          },
+          "position": {"x": 0, "y": 2, "width": 4, "height": 4}
+        },
+        {
+          "widget": {
+            "name": "query_trend_chart",
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {"fieldName": "query_date", "scale": {"type": "temporal"}, "displayName": "Date"},
+                "y": {"fieldName": "total_queries", "scale": {"type": "quantitative"}, "displayName": "Queries"},
+                "y2": {"fieldName": "distinct_users", "scale": {"type": "quantitative"}, "displayName": "Active Users"}
+              },
+              "frame": {"showTitle": true, "title": "Query Volume — Last 14 Days"},
+              "query": {"datasetName": "query_volume_trend", "fields": ["query_date", "total_queries", "distinct_users", "avg_duration_sec"]}
+            }
+          },
+          "position": {"x": 4, "y": 2, "width": 2, "height": 4}
+        }
+      ]
+    },
+    {
+      "name": "slow_queries_page",
+      "displayName": "Slow Queries",
+      "layout": [
+        {
+          "widget": {
+            "name": "slow_queries_header",
+            "textbox_spec": "## Slow Queries (>30s)\n\nQueries taking more than 30 seconds in the last 24 hours. Use this to identify optimization opportunities."
+          },
+          "position": {"x": 0, "y": 0, "width": 6, "height": 1}
+        },
+        {
+          "widget": {
+            "name": "slow_queries_table",
+            "spec": {
+              "version": 3,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {"fieldName": "user_name", "displayName": "User"},
+                  {"fieldName": "duration_sec", "displayName": "Duration (s)"},
+                  {"fieldName": "rows_produced", "displayName": "Rows"},
+                  {"fieldName": "end_time", "displayName": "Time"},
+                  {"fieldName": "query_preview", "displayName": "Query"}
+                ]
+              },
+              "frame": {"showTitle": true, "title": "Slow Queries — Last 24h"},
+              "query": {"datasetName": "slow_queries", "fields": ["user_name", "duration_sec", "rows_produced", "end_time", "query_preview"]}
+            }
+          },
+          "position": {"x": 0, "y": 1, "width": 6, "height": 5}
+        }
+      ]
+    },
+    {
+      "name": "access_page",
+      "displayName": "Access & Audit",
+      "layout": [
+        {
+          "widget": {
+            "name": "access_header",
+            "textbox_spec": "## Access & Audit\n\nUser activity and table access patterns from `system.access.audit` and `system.query.history`."
+          },
+          "position": {"x": 0, "y": 0, "width": 6, "height": 1}
+        },
+        {
+          "widget": {
+            "name": "user_activity_table",
+            "spec": {
+              "version": 3,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {"fieldName": "user_name", "displayName": "User"},
+                  {"fieldName": "query_count", "displayName": "Queries"},
+                  {"fieldName": "avg_duration_sec", "displayName": "Avg Duration (s)"},
+                  {"fieldName": "last_active", "displayName": "Last Active"}
+                ]
+              },
+              "frame": {"showTitle": true, "title": "User Activity — Last 7 Days"},
+              "query": {"datasetName": "user_activity", "fields": ["user_name", "query_count", "avg_duration_sec", "last_active"]}
+            }
+          },
+          "position": {"x": 0, "y": 1, "width": 3, "height": 4}
+        },
+        {
+          "widget": {
+            "name": "table_access_table",
+            "spec": {
+              "version": 3,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {"fieldName": "user_email", "displayName": "User"},
+                  {"fieldName": "table_name", "displayName": "Table"},
+                  {"fieldName": "action_name", "displayName": "Action"},
+                  {"fieldName": "access_count", "displayName": "Count"},
+                  {"fieldName": "last_accessed", "displayName": "Last Access"}
+                ]
+              },
+              "frame": {"showTitle": true, "title": "Table Access — Last 7 Days"},
+              "query": {"datasetName": "audit_access", "fields": ["user_email", "table_name", "action_name", "access_count", "last_accessed"]}
+            }
+          },
+          "position": {"x": 3, "y": 1, "width": 3, "height": 4}
+        }
+      ]
+    }
+  ]
+}

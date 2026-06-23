@@ -1,0 +1,108 @@
+# ETL Workflow — Extract → Transform → Load
+# ==========================================================
+# 3-task sequential Databricks Job:
+#   Task 1 (extract):   Read JSON from UC Volume → raw Delta table
+#   Task 2 (transform): Clean + enrich raw → curated Delta table
+#   Task 3 (load):      Aggregate curated → mart Delta table
+#
+# Each task passes its output table name to the next via job parameters.
+# Tasks run on serverless compute (no cluster management required).
+#
+# Usage:
+#   databricks bundle run -t dev etl_workflow
+#   databricks bundle run -t dev etl_workflow --python-params='["--full-refresh"]'
+# ==========================================================
+
+resources:
+  jobs:
+    etl_workflow:
+      name: "${var.job_name}"
+
+      tags:
+        Environment: ${var.environment_tag}
+        Project: ${var.project_tag}
+        Owner: ${var.owner_tag}
+        CostCenter: ${var.cost_center_tag}
+        ManagedBy: "DatabricksBundle"
+
+      # Shared job cluster for all tasks (cost-efficient vs. per-task cluster)
+      job_clusters:
+        - job_cluster_key: "etl_cluster"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_D4ds_v5"
+            num_workers: 1
+            spark_conf:
+              spark.databricks.delta.preview.enabled: "true"
+            data_security_mode: "SINGLE_USER"  # Required for Unity Catalog
+
+      # Email notifications on failure
+      email_notifications:
+        on_failure:
+          - "data-team@company.com"
+        no_alert_for_skipped_runs: true
+
+      # Health threshold: fail if >20% of the last 5 runs failed
+      health:
+        rules:
+          - metric: "RUN_DURATION_SECONDS"
+            op: "GREATER_THAN"
+            value: 3600  # Alert if runtime exceeds 1 hour
+
+      tasks:
+        # --------------------------------------------------------
+        # Task 1: Extract
+        # Reads raw JSON files from UC Volume → raw Delta table
+        # --------------------------------------------------------
+        - task_key: "extract"
+          description: "Ingest raw order files from UC Volume into raw Delta table"
+          job_cluster_key: "etl_cluster"
+          notebook_task:
+            notebook_path: ../../src/notebooks/raw/extract.py
+            base_parameters:
+              source_path: "${var.source_path}"
+              raw_table: "${var.raw_table}"
+          timeout_seconds: 600
+          retry_on_timeout: false
+          max_retries: 1
+          min_retry_interval_millis: 30000
+
+        # --------------------------------------------------------
+        # Task 2: Transform
+        # Reads raw → applies DQ + enrichment → curated table
+        # Depends on: extract
+        # --------------------------------------------------------
+        - task_key: "transform"
+          description: "Validate, clean, and enrich raw orders into curated"
+          job_cluster_key: "etl_cluster"
+          depends_on:
+            - task_key: "extract"
+          notebook_task:
+            notebook_path: ../../src/notebooks/curated/transform.py
+            base_parameters:
+              raw_table: "${var.raw_table}"
+              curated_table: "${var.curated_table}"
+          timeout_seconds: 900
+          retry_on_timeout: false
+          max_retries: 1
+          min_retry_interval_millis: 30000
+
+        # --------------------------------------------------------
+        # Task 3: Load
+        # Reads curated → aggregates by region → mart table
+        # Depends on: transform
+        # --------------------------------------------------------
+        - task_key: "load"
+          description: "Aggregate curated orders into mart summary table by region"
+          job_cluster_key: "etl_cluster"
+          depends_on:
+            - task_key: "transform"
+          notebook_task:
+            notebook_path: ../../src/notebooks/mart/load.py
+            base_parameters:
+              curated_table: "${var.curated_table}"
+              mart_table: "${var.mart_table}"
+          timeout_seconds: 600
+          retry_on_timeout: false
+          max_retries: 1
+          min_retry_interval_millis: 30000

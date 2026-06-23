@@ -1,0 +1,77 @@
+# Bundle Variable Declarations
+# ==========================================================
+# Variable Resolution Order (first match wins):
+# 1. CLI flag:    databricks bundle deploy -t dev --var="catalog_name=custom_catalog"
+# 2. Target override: (removed - see databricks.yml history)
+# 3. Default value: (defined below)
+#
+# CI/CD Workflow:
+# - tofu-deploy-dev.yml extracts OpenTofu outputs (catalog name, tags)
+# - Stores them as GitHub repo variables (BUNDLE_DEV_CATALOG_NAME, etc.)
+# - bundle-deploy.yml passes them as --var flags
+# - This allows custom naming conventions per customer
+#
+# Local Development:
+# - Uses defaults below (based on common.tfvars.example)
+# - Or override via: databricks bundle deploy -t dev --var="catalog_name=your_catalog"
+# ==========================================================
+
+variables:
+  environment:
+    description: "Deployment environment (dev or prod)"
+    default: "dev"
+
+  catalog_name:
+    description: "Unity Catalog name - inherited from OpenTofu output in CI/CD, or use default for local dev"
+    default: "lakehouse_${var.environment}"
+
+  pipeline_name:
+    description: "Customers pipeline display name (all layers)"
+    default: "customers_pipeline_${var.environment}"
+
+  source_path:
+    description: "Volume path to source data (UC volume raw/raw_files/customers)"
+    default: "/Volumes/${var.catalog_name}/raw/raw_files/customers/"
+
+  checkpoint_path_raw:
+    description: "Volume path for raw layer streaming checkpoints"
+    default: "/Volumes/${var.catalog_name}/raw/checkpoints/${bundle.name}/"
+
+  # -----------------------------------------------------------
+  # Tag variables — mirror the infra/common.tfvars tags map.
+  # Defaults are identical to common.tfvars.example so local
+  # deployments produce meaningful tags without any --var flags.
+  # CI/CD injects production values via --var flags derived from
+  # `tofu output -json tags` (see tofu-deploy-dev/prod.yml).
+  # -----------------------------------------------------------
+
+  environment_tag:
+    description: "Mirrors OpenTofu tags.Environment — set per target"
+    default: "dev"
+
+  project_tag:
+    description: "Mirrors OpenTofu tags.Project (from common.tfvars)"
+    default: "Azure Lakehouse Blueprint"
+
+  owner_tag:
+    description: "Mirrors OpenTofu tags.Owner (from common.tfvars)"
+    default: "DataPlatformTeam"
+
+  cost_center_tag:
+    description: "Mirrors OpenTofu tags.CostCenter (from common.tfvars)"
+    default: "Engineering"
+
+  prod_service_principal:
+    description: |
+      Azure AD App ID of the workload service principal used to run production pipelines.
+      CI/CD injects via: tofu output -raw workload_sp_application_id
+      Locally: databricks bundle deploy -t prod --var="prod_service_principal=<APP_ID>"
+      See README.md → "Service Principal Setup (Production)" for setup steps.
+    default: "REPLACE_WITH_SP_APPLICATION_ID"
+
+  warehouse_id:
+    description: |
+      SQL Warehouse ID for the Pipeline Health Monitor dashboard.
+      Find the ID in Databricks: SQL Warehouses → select warehouse → copy ID from URL.
+      Required only when deploying the dashboard resource.
+    default: "REPLACE_WITH_WAREHOUSE_ID"

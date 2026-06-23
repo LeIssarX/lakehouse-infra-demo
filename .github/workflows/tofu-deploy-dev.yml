@@ -1,0 +1,270 @@
+name: Deploy to Dev
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/envs/dev/**'    # Dev environment config (dev.tfvars, grants, identity, compute, backend.hcl)
+      - 'infra/modules/**'     # Module changes affect all envs → also triggers prod workflow
+      - 'infra/*.tf'           # Root TF files (providers, variables, outputs, resources)
+      - 'infra/common.tfvars'  # Shared config — also triggers prod workflow
+  workflow_dispatch:  # Manual trigger
+
+# Use OIDC for authentication
+permissions:
+  id-token: write      # Required for Azure OIDC authentication
+  contents: read       # Read-only access to repository code
+  pull-requests: write # For PR comments and status updates
+
+env:
+  ARM_USE_OIDC: true
+  ENVIRONMENT: dev
+
+jobs:
+  deploy-dev:
+    name: Deploy to Dev Environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # NOTE: Do NOT add 'environment: dev' here — that changes the OIDC subject claim
+    # from 'ref:refs/heads/main' to 'environment:dev', breaking the federated credential.
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: "1.10.0"
+          tofu_wrapper: false
+
+      # ==========================================================
+      # Azure Authentication (OIDC)
+      # ==========================================================
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          # Configured by: scripts/bootstrap-cicd.sh dev
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          # allow-no-subscriptions: OpenTofu uses ARM_USE_OIDC (its own WIF token) and
+          # never reads `az account list`. This flag prevents az login from failing when
+          # RBAC propagation is still in progress after a fresh wizard run.
+          allow-no-subscriptions: true
+      
+      # ==========================================================
+      # Config = the committed tfvars
+      # ==========================================================
+      # The wizard writes + commits common.tfvars + envs/dev/*.tfvars (secrets
+      # live in Key Vault, never in tfvars), so CI deploys exactly what was
+      # configured. No reconstruction from .example / a base64 secret.
+
+      - name: Verify committed tfvars
+        working-directory: infra
+        run: |
+          test -f common.tfvars || { echo "::error::infra/common.tfvars missing — commit it (the wizard writes it)."; exit 1; }
+          test -f envs/dev/dev.tfvars || { echo "::error::infra/envs/dev/dev.tfvars missing — commit it."; exit 1; }
+          echo "✅ Using committed tfvars: common.tfvars + $(ls envs/dev/*.tfvars | tr '\n' ' ')"
+
+      # ==========================================================
+      # OpenTofu Execution
+      # ==========================================================
+      
+      - name: OpenTofu Init
+        id: init
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: tofu init -backend-config=envs/dev/backend.hcl -reconfigure
+
+      # Adopt the bootstrap-pre-registered account SP into state BEFORE plan, so the
+      # saved plan doesn't try to create it (which would fail "already exists in this
+      # account"). Idempotent; no-op when not applicable.
+      - name: Adopt CI/CD service principal
+        working-directory: ${{ github.workspace }}
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: ./scripts/import-cicd-sp.sh dev
+
+      # Best-effort: removes stale Unity Catalog storage credential from a
+      # previous greenfield attempt so tofu plan/apply see no conflict.
+      # Scenario A: previous workspace still exists — deletes credential via API.
+      # Scenario B: workspace gone — exits 0 (terraform_data in-apply handles it).
+      - name: Cleanup stale Unity Catalog resources (greenfield reset guard)
+        working-directory: ${{ github.workspace }}
+        env:
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: ./scripts/cleanup-databricks-account.sh dev || echo "UC cleanup skipped or failed — continuing"
+
+      # Safety-net: if the Databricks workspace already exists (partial apply or
+      # state reset) and stale UC external locations are present in the metastore
+      # but not tracked in state, import them now so tofu apply sees them as
+      # managed resources instead of trying to CREATE them (→ "already exists").
+      # Idempotent no-op when workspace doesn't exist yet (true greenfield).
+      - name: Import untracked UC external locations into Tofu state
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: ../scripts/import-existing-uc-locations.sh dev || echo "UC location import skipped or failed — continuing"
+
+      - name: Detect Bootstrap Mode
+        id: bootstrap
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+        run: |
+          if tofu state list 2>/dev/null | grep -q "module.key_vault.azurerm_key_vault.main"; then
+            echo "✅ Existing deployment detected - bootstrap_mode=false"
+            echo "mode=false" >> $GITHUB_OUTPUT
+          else
+            echo "🆕 Greenfield deployment detected - bootstrap_mode=true"
+            echo "mode=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: OpenTofu Plan
+        id: plan
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          # Auto-discover all dev *.tfvars (core + grants + identity + compute).
+          VAR_FILES=""
+          for f in envs/dev/*.tfvars; do
+            VAR_FILES="$VAR_FILES -var-file=$f"
+          done
+          tofu plan \
+            -var-file=common.tfvars \
+            $VAR_FILES \
+            -var bootstrap_mode=${{ steps.bootstrap.outputs.mode }} \
+            -out=tfplan \
+            -no-color
+      
+      - name: Upload OpenTofu Plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: tofu-plan-dev
+          path: infra/tfplan
+      
+      # GitOps: merging config to main applies dev automatically. The PR plan
+      # (tofu-validate.yml) is the review gate; protect main to require it.
+      # account_admin propagation can lag right after bootstrap — re-run the
+      # workflow once if apply trips "API is disabled for users without account
+      # admin status".
+      - name: OpenTofu Apply
+        id: apply
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          DATABRICKS_AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          DATABRICKS_AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DATABRICKS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          tofu apply \
+            -auto-approve \
+            tfplan
+
+      # ==========================================================
+      # Post-Deployment
+      # ==========================================================
+
+      - name: Extract Outputs & Store Bundle Variables
+        id: outputs
+        working-directory: infra
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          GH_TOKEN: ${{ secrets.GH_VARIABLE_TOKEN }}
+        run: |
+          WORKSPACE_URL=$(tofu output -raw databricks_workspace_url)
+          WORKSPACE_ID=$(tofu output -raw databricks_workspace_id)
+          STORAGE_ACCOUNT=$(tofu output -json storage_account_names | jq -r '.lake')
+          CATALOG_NAME=$(tofu output -raw unity_catalog_catalog_name)
+          TAG_PROJECT=$(tofu output -json tags | jq -r '.Project // "Azure Lakehouse Blueprint"')
+          TAG_OWNER=$(tofu output -json tags | jq -r '.Owner // "DataPlatformTeam"')
+          TAG_COST_CENTER=$(tofu output -json tags | jq -r '.CostCenter // "Engineering"')
+
+          echo "workspace_url=$WORKSPACE_URL" >> $GITHUB_OUTPUT
+          echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
+          echo "storage_account=$STORAGE_ACCOUNT" >> $GITHUB_OUTPUT
+
+          # Persist values as repo variables — consumed by bundle-deploy.yml --var flags.
+          # Needs a classic PAT (GH_VARIABLE_TOKEN) with variables:write; GITHUB_TOKEN can't
+          # write repo variables. The wizard's non-interactive bootstrap skips the PAT prompt,
+          # so this is best-effort: a successful apply must not go red over a missing token.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::GH_VARIABLE_TOKEN not set — skipping repo variable updates (DATABRICKS_DEV_HOST, BUNDLE_*). Set a classic PAT with variables:write to enable auto-updates; the infra deploy is unaffected."
+          else
+            gh variable set DATABRICKS_DEV_HOST     --body "$WORKSPACE_URL"
+            gh variable set BUNDLE_DEV_CATALOG_NAME --body "$CATALOG_NAME"
+            gh variable set BUNDLE_TAG_PROJECT      --body "$TAG_PROJECT"
+            gh variable set BUNDLE_TAG_OWNER        --body "$TAG_OWNER"
+            gh variable set BUNDLE_TAG_COST_CENTER  --body "$TAG_COST_CENTER"
+          fi
+
+          echo "### Deployment Complete! 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** dev" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace URL:** $WORKSPACE_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace ID:** $WORKSPACE_ID" >> $GITHUB_STEP_SUMMARY
+          echo "**Storage Account:** $STORAGE_ACCOUNT" >> $GITHUB_STEP_SUMMARY
+      
+      # Deployment summary available in workflow run logs and GitHub Actions UI
+      # Commit comments removed to comply with least-privilege permissions (contents: read)
+      
+      # ==========================================================
+      # Notification (Optional)
+      # ==========================================================
+      
+      # FIXME: Uncomment to enable Slack notifications
+      # - name: Notify Slack
+      #   if: always()
+      #   uses: slackapi/slack-github-action@v1.25.0
+      #   with:
+      #     webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+      #     payload: |
+      #       {
+      #         "text": "${{ job.status == 'success' ? '✅' : '❌' }} Dev Deployment: ${{ job.status }}",
+      #         "blocks": [
+      #           {
+      #             "type": "section",
+      #             "text": {
+      #               "type": "mrkdwn",
+      #               "text": "Dev deployment *${{ job.status }}*\\n*Workspace:* ${{ steps.outputs.outputs.workspace_url }}"
+      #             }
+      #           }
+      #         ]
+      #       }
