@@ -116,7 +116,7 @@ key_vault_rbac_propagation_wait      = "180s"
 
 # Project Metadata
 project_name      = "LakehouseBlueprint"
-project_slug      = "lakehouse"
+project_slug      = "isar234"
 log_analytics_sku = "PerGB2018"
 
 # Workspace & Governance Feature Flags
